@@ -34,7 +34,7 @@ Java_com_whats_bot_LlamaHelper_loadModelNative(JNIEnv* env, jobject, jstring jpa
     const char* path = env->GetStringUTFChars(jpath, nullptr);
     llama_backend_init();
     llama_model_params mp = llama_model_default_params();
-    mp.use_mmap = false;                 // load fully into RAM
+    mp.load_mode = LLAMA_LOAD_MODE_NONE; // no mmap, load fully into RAM                 // load fully into RAM
     llama_model* m = llama_model_load_from_file(path, mp);
     env->ReleaseStringUTFChars(jpath, path);
     if (!m) return 0;
@@ -70,7 +70,7 @@ Java_com_whats_bot_LlamaHelper_generateNative(JNIEnv* env, jobject, jlong ptr, j
                                toks.data(), n, true, true) >= 0) {
 
                 llama_sampler* s = llama_sampler_chain_init(llama_sampler_chain_default_params());
-                llama_sampler_chain_add(s, llama_sampler_init_penalties(64, WA_REPEAT_PENALTY, 0.0f, 0.0f));
+                llama_sampler_chain_add(s, llama_sampler_init_penalties(llama_vocab_n_tokens(vocab), 64, WA_REPEAT_PENALTY, 0.0f, 0.0f));
                 llama_sampler_chain_add(s, llama_sampler_init_top_k(WA_TOP_K));
                 llama_sampler_chain_add(s, llama_sampler_init_top_p(WA_TOP_P, 1));
                 llama_sampler_chain_add(s, llama_sampler_init_temp(WA_TEMP));
