@@ -1,12 +1,12 @@
 cmake_minimum_required(VERSION 3.22)
 project(watcher_jni C CXX)
 
-# ---- Tunables (override with -DWA_TEMP=0.7 etc.) ----
-set(WA_TEMP           "0.85" CACHE STRING "temperature")
+# ---- Tunables (override with -DWA_TEMP=0.5 etc.) ----
+set(WA_TEMP           "0.6"  CACHE STRING "temperature")
 set(WA_TOP_K          "40"   CACHE STRING "top-k")
-set(WA_TOP_P          "0.95" CACHE STRING "top-p")
+set(WA_TOP_P          "0.9"  CACHE STRING "top-p")
 set(WA_REPEAT_PENALTY "1.1"  CACHE STRING "repeat penalty")
-set(WA_MAX_TOKENS     "80"   CACHE STRING "max new tokens")
+set(WA_MAX_TOKENS     "48"   CACHE STRING "max new tokens")
 set(WA_N_CTX          "1024" CACHE STRING "context size")
 set(WA_N_THREADS      "4"    CACHE STRING "CPU threads")
 
