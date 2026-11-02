@@ -49,7 +49,6 @@ static jboolean n_load(JNIEnv *env, jclass, jstring jpath, jint nCtx, jint nThre
     }
     const char *path = env->GetStringUTFChars(jpath, nullptr);
     llama_model_params mp = llama_model_default_params();
-    mp.use_mmap = true;
     g_model = llama_model_load_from_file(path, mp);
     env->ReleaseStringUTFChars(jpath, path);
     if (!g_model) {
@@ -196,7 +195,7 @@ static jint n_generate(JNIEnv *env, jclass, jobjectArray jroles, jobjectArray jc
     if (temperature <= 0.0f) {
         llama_sampler_chain_add(smpl, llama_sampler_init_greedy());
     } else {
-        llama_sampler_chain_add(smpl, llama_sampler_init_penalties(96, 1.15f, 0.0f, 0.0f));
+        llama_sampler_chain_add(smpl, llama_sampler_init_penalties(llama_vocab_n_tokens(vocab), 96, 1.15f, 0.0f, 0.0f));
         llama_sampler_chain_add(smpl, llama_sampler_init_top_k(40));
         llama_sampler_chain_add(smpl, llama_sampler_init_top_p(0.9f, 1));
         llama_sampler_chain_add(smpl, llama_sampler_init_temp(temperature));
