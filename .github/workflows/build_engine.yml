@@ -1,0 +1,58 @@
+name: Build Agent Engine
+
+on:
+  workflow_dispatch:
+    inputs:
+      jni_class:
+        description: "JNI class path (slashes, not dots)"
+        required: true
+        default: "com/aegis/agent/LlamaBridge"
+      release_tag:
+        description: "Release tag to publish libagentllm.so to"
+        required: true
+        default: "agent-engine"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Clone llama.cpp
+        run: git clone --depth 1 https://github.com/ggml-org/llama.cpp "$RUNNER_TEMP/llama.cpp"
+
+      - name: Configure
+        run: |
+          cmake -S agent-engine -B build \
+            -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM=android-24 \
+            -DANDROID_STL=c++_static \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLLAMA_DIR="$RUNNER_TEMP/llama.cpp" \
+            -DJNI_CLASS="${{ github.event.inputs.jni_class }}" \
+            -DGGML_NATIVE=OFF \
+            -DGGML_OPENMP=OFF \
+            -DGGML_CPU_ARM_ARCH=armv8.2-a+dotprod \
+            -DCMAKE_C_FLAGS="-O3" \
+            -DCMAKE_CXX_FLAGS="-O3"
+
+      - name: Build
+        run: cmake --build build --config Release -j 4 --target agentllm
+
+      - name: Strip
+        run: |
+          "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip" --strip-unneeded build/libagentllm.so
+          ls -la build/libagentllm.so
+
+      - name: Publish release asset
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.release_tag }}
+          name: Agent Engine
+          files: build/libagentllm.so
