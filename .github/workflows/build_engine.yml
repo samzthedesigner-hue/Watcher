@@ -4,11 +4,15 @@ on:
   workflow_dispatch:
     inputs:
       jni_class:
-        description: "JNI class path (slashes, not dots)"
+        description: "LLM JNI class path (slashes, not dots)"
         required: true
         default: "com/aegis/agent/LlamaBridge"
+      ocr_class:
+        description: "OCR JNI class path (slashes, not dots)"
+        required: true
+        default: "com/aegis/agent/Ocr"
       release_tag:
-        description: "Release tag to publish libagentllm.so to"
+        description: "Release tag to publish to"
         required: true
         default: "agent-engine"
 
@@ -18,7 +22,7 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -26,7 +30,7 @@ jobs:
       - name: Clone llama.cpp
         run: git clone --depth 1 https://github.com/ggml-org/llama.cpp "$RUNNER_TEMP/llama.cpp"
 
-      - name: Configure
+      - name: Configure LLM engine
         run: |
           cmake -S agent-engine -B build \
             -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake" \
@@ -42,17 +46,55 @@ jobs:
             -DCMAKE_C_FLAGS="-O3" \
             -DCMAKE_CXX_FLAGS="-O3"
 
-      - name: Build
+      - name: Build LLM engine
         run: cmake --build build --config Release -j 4 --target agentllm
 
-      - name: Strip
+      - name: Strip LLM engine
         run: |
           "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip" --strip-unneeded build/libagentllm.so
           ls -la build/libagentllm.so
 
-      - name: Publish release asset
+      - name: Build OCR engine (Tesseract)
+        continue-on-error: true
+        run: |
+          set -e
+          TC="$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake"
+          COMMON="-DCMAKE_TOOLCHAIN_FILE=$TC -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-24 -DANDROID_STL=c++_static -DCMAKE_BUILD_TYPE=Release -DCMAKE_POSITION_INDEPENDENT_CODE=ON"
+          PREFIX="$RUNNER_TEMP/ocr-prefix"
+
+          git clone --depth 1 --branch 1.84.1 https://github.com/DanBloomberg/leptonica "$RUNNER_TEMP/leptonica"
+          git clone --depth 1 --branch 5.5.0 https://github.com/tesseract-ocr/tesseract "$RUNNER_TEMP/tesseract"
+
+          cmake -S "$RUNNER_TEMP/leptonica" -B "$RUNNER_TEMP/b-lept" $COMMON \
+            -DCMAKE_INSTALL_PREFIX="$PREFIX" \
+            -DBUILD_SHARED_LIBS=OFF -DSW_BUILD=OFF -DBUILD_PROG=OFF
+          cmake --build "$RUNNER_TEMP/b-lept" -j 4 --target install
+
+          cmake -S "$RUNNER_TEMP/tesseract" -B "$RUNNER_TEMP/b-tess" $COMMON \
+            -DCMAKE_INSTALL_PREFIX="$PREFIX" \
+            -DCMAKE_PREFIX_PATH="$PREFIX" \
+            -DCMAKE_FIND_ROOT_PATH="$PREFIX" \
+            -DLeptonica_DIR="$PREFIX/lib/cmake/leptonica" \
+            -DBUILD_SHARED_LIBS=OFF -DSW_BUILD=OFF \
+            -DBUILD_TRAINING_TOOLS=OFF -DBUILD_TESTS=OFF \
+            -DBUILD_TESSERACT_BINARY=OFF \
+            -DOPENMP_BUILD=OFF -DDISABLE_CURL=ON -DDISABLE_ARCHIVE=ON \
+            -DGRAPHICS_DISABLED=ON -DDISABLED_LEGACY_ENGINE=ON
+          cmake --build "$RUNNER_TEMP/b-tess" -j 4 --target install
+
+          cmake -S agent-engine/ocr -B build-ocr $COMMON \
+            -DCMAKE_PREFIX_PATH="$PREFIX" \
+            -DCMAKE_FIND_ROOT_PATH="$PREFIX" \
+            -DOCR_CLASS="${{ github.event.inputs.ocr_class }}"
+          cmake --build build-ocr -j 4
+          "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip" --strip-unneeded build-ocr/libagentocr.so
+          ls -la build-ocr/libagentocr.so
+
+      - name: Publish release assets
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.event.inputs.release_tag }}
           name: Agent Engine
-          files: build/libagentllm.so
+          files: |
+            build/libagentllm.so
+            build-ocr/libagentocr.so
