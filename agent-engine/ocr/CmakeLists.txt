@@ -1,0 +1,20 @@
+cmake_minimum_required(VERSION 3.22)
+project(agentocr CXX)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+
+set(OCR_CLASS "com/aegis/agent/Ocr" CACHE STRING "JNI class path")
+
+find_package(Leptonica REQUIRED CONFIG)
+find_package(Tesseract REQUIRED CONFIG)
+
+add_library(agentocr SHARED ocr_jni.cpp)
+
+target_compile_definitions(agentocr PRIVATE OCR_CLASS="${OCR_CLASS}")
+target_link_libraries(agentocr PRIVATE Tesseract::libtesseract log)
+
+target_link_options(agentocr PRIVATE
+        -Wl,-z,max-page-size=16384
+        -Wl,--gc-sections)
