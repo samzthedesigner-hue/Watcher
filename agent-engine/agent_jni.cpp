@@ -2,7 +2,6 @@
 #include <android/log.h>
 #include <algorithm>
 #include <atomic>
-#include <cmath>
 #include <string>
 #include <vector>
 
@@ -15,12 +14,17 @@
 #define TAG "AgentLLM"
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
 
-static llama_model *g_model = nullptr;
-static llama_context *g_ctx = nullptr;
+struct Slot {
+    llama_model *model = nullptr;
+    llama_context *ctx = nullptr;
+    int n_ctx = 4096;
+    int threads = 4;
+    std::vector<llama_token> cache;
+};
+
+static Slot g_slots[2];
 static std::atomic<bool> g_stop(false);
-static int g_n_ctx = 4096;
 static bool g_backend_ready = false;
-static std::vector<llama_token> g_eog;
 
 static void log_cb(ggml_log_level level, const char *text, void *) {
     if (level == GGML_LOG_LEVEL_ERROR) {
@@ -28,20 +32,58 @@ static void log_cb(ggml_log_level level, const char *text, void *) {
     }
 }
 
-static void release_all() {
-    if (g_ctx) {
-        llama_free(g_ctx);
-        g_ctx = nullptr;
+static void free_ctx(Slot &s) {
+    if (s.ctx) {
+        llama_free(s.ctx);
+        s.ctx = nullptr;
     }
-    if (g_model) {
-        llama_model_free(g_model);
-        g_model = nullptr;
-    }
-    g_eog.clear();
+    s.cache.clear();
 }
 
-static jboolean n_load(JNIEnv *env, jclass, jstring jpath, jint nCtx, jint nThreads) {
-    release_all();
+static void free_all(Slot &s) {
+    free_ctx(s);
+    if (s.model) {
+        llama_model_free(s.model);
+        s.model = nullptr;
+    }
+}
+
+static bool ensure_ctx(Slot &s) {
+    if (s.ctx) {
+        return true;
+    }
+    if (!s.model) {
+        return false;
+    }
+    llama_context_params cp = llama_context_default_params();
+    cp.n_ctx = (uint32_t) s.n_ctx;
+    cp.n_batch = 512;
+    cp.n_ubatch = 512;
+    cp.n_threads = s.threads;
+    cp.n_threads_batch = s.threads;
+    s.ctx = llama_init_from_model(s.model, cp);
+    if (!s.ctx) {
+        LOGE("context init failed");
+        return false;
+    }
+    s.n_ctx = (int) llama_n_ctx(s.ctx);
+    s.cache.clear();
+    return true;
+}
+
+static std::string jstr(JNIEnv *env, jstring js) {
+    const char *c = env->GetStringUTFChars(js, nullptr);
+    std::string out(c ? c : "");
+    env->ReleaseStringUTFChars(js, c);
+    return out;
+}
+
+static jboolean n_load(JNIEnv *env, jclass, jint slot, jstring jpath, jint nCtx, jint nThreads) {
+    if (slot < 0 || slot > 1) {
+        return JNI_FALSE;
+    }
+    Slot &s = g_slots[slot];
+    free_all(s);
     if (!g_backend_ready) {
         llama_log_set(log_cb, nullptr);
         llama_backend_init();
@@ -49,73 +91,52 @@ static jboolean n_load(JNIEnv *env, jclass, jstring jpath, jint nCtx, jint nThre
     }
     const char *path = env->GetStringUTFChars(jpath, nullptr);
     llama_model_params mp = llama_model_default_params();
-    g_model = llama_model_load_from_file(path, mp);
+    s.model = llama_model_load_from_file(path, mp);
     env->ReleaseStringUTFChars(jpath, path);
-    if (!g_model) {
-        LOGE("model load failed");
+    if (!s.model) {
+        LOGE("model load failed (slot %d)", (int) slot);
         return JNI_FALSE;
     }
-    llama_context_params cp = llama_context_default_params();
-    cp.n_ctx = (uint32_t) nCtx;
-    cp.n_batch = 512;
-    cp.n_ubatch = 512;
-    cp.n_threads = nThreads;
-    cp.n_threads_batch = nThreads;
-    g_ctx = llama_init_from_model(g_model, cp);
-    if (!g_ctx) {
-        LOGE("context init failed");
-        llama_model_free(g_model);
-        g_model = nullptr;
-        return JNI_FALSE;
-    }
-    g_n_ctx = (int) llama_n_ctx(g_ctx);
-
-    const llama_vocab *vocab = llama_model_get_vocab(g_model);
-    int nv = llama_vocab_n_tokens(vocab);
-    for (int t = 0; t < nv; t++) {
-        if (llama_vocab_is_eog(vocab, t)) {
-            g_eog.push_back(t);
-        }
-    }
+    s.n_ctx = nCtx;
+    s.threads = nThreads;
     return JNI_TRUE;
 }
 
-static std::string jstr(JNIEnv *env, jstring s) {
-    const char *c = env->GetStringUTFChars(s, nullptr);
-    std::string out(c ? c : "");
-    env->ReleaseStringUTFChars(s, c);
-    return out;
+static void n_free_ctx(JNIEnv *, jclass, jint slot) {
+    if (slot >= 0 && slot <= 1) {
+        free_ctx(g_slots[slot]);
+    }
 }
 
-static bool ends_sentence(const char *p, int len) {
-    for (int i = 0; i < len; i++) {
-        if (p[i] == '\n') {
-            return true;
-        }
+static void n_release(JNIEnv *, jclass, jint slot) {
+    if (slot >= 0 && slot <= 1) {
+        g_stop = true;
+        free_all(g_slots[slot]);
     }
-    if (len <= 0) {
-        return false;
-    }
-    char c = p[len - 1];
-    return c == '.' || c == '!' || c == '?';
+}
+
+static void n_stop(JNIEnv *, jclass) {
+    g_stop = true;
 }
 
 /*
- * Generates a reply.
- *  minTokens: end-of-text is blocked until this many tokens exist.
- *  softMax:   after this many tokens, stop at the next sentence end.
- *  hardMax:   absolute cap.
- * Returns 0 on success, negative on error.
+ * Returns 0 on success, negative on error:
+ * -1 no model, -2 template, -3 tokenize, -4 prompt too long, -5 prompt decode, -6 decode, -7 no context
  */
-static jint n_generate(JNIEnv *env, jclass, jobjectArray jroles, jobjectArray jcontents,
-                       jint minTokens, jint softMax, jint hardMax, jfloat temperature,
-                       jobject sink) {
-    if (!g_model || !g_ctx) {
+static jint n_generate(JNIEnv *env, jclass, jint slot, jobjectArray jroles, jobjectArray jcontents,
+                       jint maxTokens, jfloat temperature, jobject sink) {
+    if (slot < 0 || slot > 1) {
         return -1;
+    }
+    Slot &s = g_slots[slot];
+    if (!s.model) {
+        return -1;
+    }
+    if (!ensure_ctx(s)) {
+        return -7;
     }
     g_stop = false;
 
-    // ---- chat messages ----
     jsize count = env->GetArrayLength(jroles);
     std::vector<std::string> roles(count), contents(count);
     std::vector<llama_chat_message> msgs(count);
@@ -134,7 +155,7 @@ static jint n_generate(JNIEnv *env, jclass, jobjectArray jroles, jobjectArray jc
         msgs[i].content = contents[i].c_str();
     }
 
-    const char *tmpl = llama_model_chat_template(g_model, nullptr);
+    const char *tmpl = llama_model_chat_template(s.model, nullptr);
     std::vector<char> buf(total * 2 + 2048);
     int n = llama_chat_apply_template(tmpl ? tmpl : "chatml", msgs.data(), msgs.size(), true,
                                       buf.data(), (int32_t) buf.size());
@@ -157,8 +178,7 @@ static jint n_generate(JNIEnv *env, jclass, jobjectArray jroles, jobjectArray jc
     }
     std::string prompt(buf.data(), n);
 
-    // ---- tokenize ----
-    const llama_vocab *vocab = llama_model_get_vocab(g_model);
+    const llama_vocab *vocab = llama_model_get_vocab(s.model);
     int nt = -llama_tokenize(vocab, prompt.c_str(), (int32_t) prompt.size(), nullptr, 0, true, true);
     if (nt <= 0) {
         return -3;
@@ -168,34 +188,49 @@ static jint n_generate(JNIEnv *env, jclass, jobjectArray jroles, jobjectArray jc
                        (int32_t) toks.size(), true, true) < 0) {
         return -3;
     }
-    if ((int) toks.size() + 32 >= g_n_ctx) {
+    if ((int) toks.size() + 32 >= s.n_ctx) {
         return -4;
     }
-    int room = g_n_ctx - (int) toks.size() - 1;
-    int hard = std::min((int) hardMax, room);
-    int soft = std::min((int) softMax, hard);
-    int minT = std::min((int) minTokens, hard);
+    int maxGen = std::min((int) maxTokens, s.n_ctx - (int) toks.size() - 1);
+    if (maxGen <= 0) {
+        return -4;
+    }
 
-    // ---- fresh state every call: keeps long loops stable ----
-    llama_memory_clear(llama_get_memory(g_ctx), true);
+    // Reuse the KV cache for the part of the prompt that matches the previous call.
+    llama_memory_t mem = llama_get_memory(s.ctx);
+    size_t keep = 0;
+    size_t maxKeep = toks.size() - 1;
+    while (keep < s.cache.size() && keep < maxKeep && s.cache[keep] == toks[keep]) {
+        keep++;
+    }
+    if (keep == 0 || !llama_memory_seq_rm(mem, 0, (llama_pos) keep, -1)) {
+        llama_memory_clear(mem, true);
+        keep = 0;
+    }
+    s.cache.assign(toks.begin(), toks.begin() + keep);
+
     const int nb = 512;
-    for (size_t i = 0; i < toks.size(); i += nb) {
+    for (size_t i = keep; i < toks.size(); i += nb) {
         if (g_stop) {
+            s.cache.clear();
+            llama_memory_clear(mem, true);
             return 0;
         }
         int len = (int) std::min((size_t) nb, toks.size() - i);
         llama_batch b = llama_batch_get_one(toks.data() + i, len);
-        if (llama_decode(g_ctx, b) != 0) {
+        if (llama_decode(s.ctx, b) != 0) {
+            s.cache.clear();
+            llama_memory_clear(mem, true);
             return -5;
         }
+        s.cache.insert(s.cache.end(), toks.begin() + i, toks.begin() + i + len);
     }
 
-    // ---- sampler tuned for small models ----
     llama_sampler *smpl = llama_sampler_chain_init(llama_sampler_chain_default_params());
     if (temperature <= 0.0f) {
         llama_sampler_chain_add(smpl, llama_sampler_init_greedy());
     } else {
-        llama_sampler_chain_add(smpl, llama_sampler_init_penalties(llama_vocab_n_tokens(vocab), 96, 1.15f, 0.0f, 0.0f));
+        llama_sampler_chain_add(smpl, llama_sampler_init_penalties(llama_vocab_n_tokens(vocab), 128, 1.1f, 0.0f, 0.0f));
         llama_sampler_chain_add(smpl, llama_sampler_init_top_k(40));
         llama_sampler_chain_add(smpl, llama_sampler_init_top_p(0.9f, 1));
         llama_sampler_chain_add(smpl, llama_sampler_init_temp(temperature));
@@ -204,31 +239,10 @@ static jint n_generate(JNIEnv *env, jclass, jobjectArray jroles, jobjectArray jc
 
     jclass sinkCls = env->GetObjectClass(sink);
     jmethodID onToken = env->GetMethodID(sinkCls, "onToken", "([B)V");
-    int nv = llama_vocab_n_tokens(vocab);
-    std::vector<llama_token_data> cand(nv);
     int rc = 0;
 
-    for (int i = 0; i < hard && !g_stop; i++) {
-        float *logits = llama_get_logits_ith(g_ctx, -1);
-        if (!logits) {
-            rc = -6;
-            break;
-        }
-        for (int t = 0; t < nv; t++) {
-            cand[t].id = t;
-            cand[t].logit = logits[t];
-            cand[t].p = 0.0f;
-        }
-        if (i < minT) {
-            for (size_t k = 0; k < g_eog.size(); k++) {
-                cand[g_eog[k]].logit = -INFINITY;
-            }
-        }
-        llama_token_data_array arr = {cand.data(), (size_t) nv, -1, false};
-        llama_sampler_apply(smpl, &arr);
-        llama_token id = arr.data[arr.selected].id;
-        llama_sampler_accept(smpl, id);
-
+    for (int i = 0; i < maxGen && !g_stop; i++) {
+        llama_token id = llama_sampler_sample(smpl, s.ctx, -1);
         if (llama_vocab_is_eog(vocab, id)) {
             break;
         }
@@ -244,42 +258,34 @@ static jint n_generate(JNIEnv *env, jclass, jobjectArray jroles, jobjectArray jc
                 break;
             }
         }
-        if (i + 1 >= soft && len > 0 && ends_sentence(piece, len)) {
-            break;
-        }
         if (g_stop) {
             break;
         }
         llama_batch b = llama_batch_get_one(&id, 1);
-        if (llama_decode(g_ctx, b) != 0) {
+        if (llama_decode(s.ctx, b) != 0) {
             rc = -6;
+            s.cache.clear();
+            llama_memory_clear(mem, true);
             break;
         }
+        s.cache.push_back(id);
     }
 
     llama_sampler_free(smpl);
     return rc;
 }
 
-static void n_stop(JNIEnv *, jclass) {
-    g_stop = true;
-}
-
-static void n_release(JNIEnv *, jclass) {
-    g_stop = true;
-    release_all();
-}
-
 static const JNINativeMethod METHODS[] = {
-        {"nativeLoad", "(Ljava/lang/String;II)Z", (void *) n_load},
+        {"nativeLoad", "(ILjava/lang/String;II)Z", (void *) n_load},
+        {"nativeFreeContext", "(I)V", (void *) n_free_ctx},
         {"nativeGenerate",
-         "([Ljava/lang/String;[Ljava/lang/String;IIIFL" JNI_CLASS "$TokenSink;)I",
+         "(I[Ljava/lang/String;[Ljava/lang/String;IFL" JNI_CLASS "$TokenSink;)I",
          (void *) n_generate},
         {"nativeStop", "()V", (void *) n_stop},
-        {"nativeRelease", "()V", (void *) n_release},
+        {"nativeRelease", "(I)V", (void *) n_release},
 };
 
-JNIEXPORT jint JNI_OnLoad(JavaVM *vm, void *) {
+extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *) {
     JNIEnv *env = nullptr;
     if (vm->GetEnv((void **) &env, JNI_VERSION_1_6) != JNI_OK) {
         return JNI_ERR;
